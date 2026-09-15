@@ -23,12 +23,19 @@ const seedPigeons = {
 const pigeonStore = new JsonStore(join(dataDir, "pigeons.json"), seedPigeons);
 await mkdir(dataDir, { recursive: true });
 // 主密钥：RING_MASTER_KEY 环境变量，或 dataDir/master.key（首启自动生成，0600）。
-const keyManager = await KeyManager.create({ dataDir });
-const ringsStore = new JsonStore(join(dataDir, "rings.json"), initialRingsState(), {
-  // 内存持明文密钥供验签；磁盘只写 AES-256-GCM 信封；旧明文数据加载即升级重写。
-  serialize: (state) => keyManager.serialize(state),
-  deserialize: (disk) => keyManager.deserialize(disk)
-});
+let keyManager;
+let ringsStore;
+try {
+  keyManager = await KeyManager.create({ dataDir });
+  ringsStore = new JsonStore(join(dataDir, "rings.json"), initialRingsState(), {
+    // 内存持明文密钥供验签；磁盘只写绑定设备的 AES-256-GCM 信封；旧数据加载即升级重写。
+    serialize: (state) => keyManager.serialize(state),
+    deserialize: (disk) => keyManager.deserialize(disk)
+  });
+} catch (error) {
+  console.error(`启动失败：主密钥不可用（${error.message}）。检查 RING_MASTER_KEY 或 data/master.key。`);
+  process.exit(1);
+}
 const rings = new RingsService(ringsStore, {
   getPigeon: (ringNo) => {
     // rings 事务期间读取鸽只档案（只读，不与 pigeonStore 事务交叉写）。
@@ -36,9 +43,16 @@ const rings = new RingsService(ringsStore, {
     return state && state.pigeons.find(p => p.ringNo === ringNo);
   }
 });
-// 服务启动时把数据载入内存（ringsStore.load 会完成旧明文数据的安全升级重写）。
-await pigeonStore.load();
-await ringsStore.load();
+// 服务启动时把数据载入内存：ringsStore.load 会完成旧格式安全升级；
+// 信封被跨设备替换/篡改/主密钥不符时在此 fail-fast，绝不带错启动。
+try {
+  await pigeonStore.load();
+  await ringsStore.load();
+} catch (error) {
+  console.error(`启动失败：电子环数据无法安全加载（${error.code || error.message}）。`);
+  if (error.deviceId) console.error(`问题设备：${error.deviceId}——密钥信封与设备不匹配，疑似跨设备替换。`);
+  process.exit(1);
+}
 
 async function body(req) {
   const chunks = [];
