@@ -1,14 +1,17 @@
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { JsonStore } from "./lib/store.js";
+import { RingsService, initialRingsState, DomainError } from "./lib/rings.js";
+import { authenticate } from "./lib/auth.js";
+import { PAGE } from "./lib/page.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "pigeons.json");
+const dataDir = process.env.DATA_DIR || join(__dirname, "data");
 const port = Number(process.env.PORT || 3024);
 
-const seed = {
+const seedPigeons = {
   pigeons: [
     { ringNo: "CHN-2026-001", owner: "北岸棚", fatherRing: "CHN-2022-188", motherRing: "CHN-2023-512", color: "灰", loft: "北岸A棚", vaccines: [{ date: "2026-04-01", name: "新城疫" }], transfers: [{ date: "2026-04-15", from: "育种棚", to: "北岸棚" }], races: [{ date: "2026-06-01", event: "120公里训放", distance: 120, returnTime: "10:42", rank: 18 }] },
     { ringNo: "CHN-2022-188", owner: "育种棚", fatherRing: "", motherRing: "", color: "雨点", loft: "种鸽棚", vaccines: [], transfers: [], races: [] },
@@ -16,153 +19,182 @@ const seed = {
   ]
 };
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await writeFile(dbPath, JSON.stringify(seed, null, 2));
+const pigeonStore = new JsonStore(join(dataDir, "pigeons.json"), seedPigeons);
+const ringsStore = new JsonStore(join(dataDir, "rings.json"), initialRingsState());
+const rings = new RingsService(ringsStore, {
+  getPigeon: (ringNo) => {
+    // rings 事务期间读取鸽只档案（只读，不与 pigeonStore 事务交叉写）。
+    const state = pigeonStore.state;
+    return state && state.pigeons.find(p => p.ringNo === ringNo);
   }
-  return JSON.parse(await readFile(dbPath, "utf8"));
-}
-async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
+});
+// 服务启动时把鸽只档案载入内存，供 getPigeon 查询。
+await mkdir(dataDir, { recursive: true });
+await pigeonStore.load();
+
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
-  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
+  if (!chunks.length) return {};
+  try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+  catch { throw new DomainError("bad_json", 400); }
 }
 function sendJson(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(data, null, 2));
 }
-function relation(db, ringNo) {
-  const pigeon = db.pigeons.find(item => item.ringNo === ringNo);
-  if (!pigeon) return null;
-  const father = db.pigeons.find(item => item.ringNo === pigeon.fatherRing) || null;
-  const mother = db.pigeons.find(item => item.ringNo === pigeon.motherRing) || null;
-  const children = db.pigeons.filter(item => item.fatherRing === ringNo || item.motherRing === ringNo);
-  return { pigeon, father, mother, children };
-}
 
-const page = `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>赛鸽血统环号登记站</title>
-  <style>
-    :root { --bg:#eff2f5; --panel:#fff; --ink:#1f2833; --muted:#697786; --line:#d3dce4; --accent:#315f83; --red:#9b3f35; }
-    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
-    header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    h1 { margin:0; font-size:26px; } main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; }
-    form,.panel,.card,.stat { background:#fff; border:1px solid var(--line); border-radius:8px; padding:16px; } h2 { margin:0 0 12px; font-size:18px; }
-    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; }
-    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; }
-    .toolbar { display:grid; grid-template-columns:1fr auto; gap:10px; margin-bottom:14px; } .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; }
-    .card { display:grid; gap:8px; } .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .section { margin-top:14px; } .relation { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:14px; } .small { background:#f8fafb; border:1px solid var(--line); border-radius:8px; padding:10px; }
-    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} .relation{grid-template-columns:1fr;} }
-  </style>
-</head>
-<body>
-  <header><div><h1>赛鸽血统环号登记站</h1><div class="meta">档案、血统、转让和归巢成绩</div></div><button id="reload">刷新</button></header>
-  <main>
-    <form id="form">
-      <h2>创建鸽只档案</h2>
-      <label>足环号</label><input name="ringNo" required>
-      <label>鸽主</label><input name="owner" required>
-      <label>父鸽足环号</label><input name="fatherRing">
-      <label>母鸽足环号</label><input name="motherRing">
-      <label>羽色</label><input name="color" required>
-      <label>出生棚号</label><input name="loft" required>
-      <button>保存档案</button>
-    </form>
-    <section>
-      <div class="toolbar"><input id="search" placeholder="输入足环号查询血统"><button id="searchBtn">查询</button></div>
-      <div class="panel" id="detail"></div>
-      <div class="section grid" id="cards"></div>
-    </section>
-  </main>
-  <script>
-    const form = document.querySelector("#form");
-    const cards = document.querySelector("#cards");
-    const detail = document.querySelector("#detail");
-    const search = document.querySelector("#search");
-    let pigeons = [];
-    async function api(path, options) {
-      const res = await fetch(path, options && options.body ? { ...options, headers:{ "Content-Type":"application/json" } } : options);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "请求失败");
-      return data;
-    }
-    function renderCards() {
-      cards.innerHTML = pigeons.map(p => '<article class="card"><h3>'+p.ringNo+'</h3><span class="pill">'+p.owner+'</span><div class="meta">'+p.color+' · '+p.loft+'</div><div>父：'+(p.fatherRing || "未登记")+'</div><div>母：'+(p.motherRing || "未登记")+'</div><label>录入转让</label><input data-to="'+p.ringNo+'" placeholder="新归属人"><button data-transfer="'+p.ringNo+'">保存转让</button><label>归巢成绩</label><input data-race="'+p.ringNo+'" placeholder="赛事/距离/名次，如200公里/200/6"><button data-score="'+p.ringNo+'">保存成绩</button></article>').join("");
-      document.querySelectorAll("[data-transfer]").forEach(btn => btn.onclick = async () => {
-        const ringNo = btn.dataset.transfer; const to = document.querySelector('[data-to="'+ringNo+'"]').value;
-        await api('/api/pigeons/'+encodeURIComponent(ringNo)+'/transfers', { method:'POST', body: JSON.stringify({ to }) }); await load();
-      });
-      document.querySelectorAll("[data-score]").forEach(btn => btn.onclick = async () => {
-        const ringNo = btn.dataset.score; const raw = document.querySelector('[data-race="'+ringNo+'"]').value.split("/");
-        await api('/api/pigeons/'+encodeURIComponent(ringNo)+'/races', { method:'POST', body: JSON.stringify({ event: raw[0] || "未命名赛事", distance: Number(raw[1] || 0), rank: Number(raw[2] || 0) }) }); await load();
-      });
-    }
-    function renderRelation(data) {
-      if (!data) { detail.innerHTML = '<h2>血统查询</h2><p class="meta">请输入足环号查看父母、子代、转让和成绩。</p>'; return; }
-      const p = data.pigeon;
-      detail.innerHTML = '<h2>'+p.ringNo+' 血统档案</h2><div class="relation"><div class="small"><b>父鸽</b><br>'+(data.father?.ringNo || p.fatherRing || "未登记")+'</div><div class="small"><b>本鸽</b><br>'+p.owner+' · '+p.color+'</div><div class="small"><b>母鸽</b><br>'+(data.mother?.ringNo || p.motherRing || "未登记")+'</div></div><div><b>子代</b> '+(data.children.map(c => c.ringNo).join("、") || "暂无")+'</div><div class="meta">转让：'+(p.transfers.map(t => t.from+"→"+t.to).join(" / ") || "暂无")+'</div><div class="meta">归巢：'+(p.races.map(r => r.event+" 第"+r.rank+"名").join(" / ") || "暂无")+'</div>';
-    }
-    async function load(){ pigeons = await api("/api/pigeons"); renderCards(); renderRelation(null); }
-    document.querySelector("#searchBtn").onclick = async () => renderRelation(await api('/api/pigeons/'+encodeURIComponent(search.value)+'/relation'));
-    document.querySelector("#reload").onclick = load;
-    form.onsubmit = async event => {
-      event.preventDefault();
-      await api("/api/pigeons", { method:"POST", body: JSON.stringify(Object.fromEntries(new FormData(form).entries())) });
-      form.reset(); await load();
-    };
-    load();
-  </script>
-</body>
-</html>`;
+// 仅管理员；返回 identity 或写响应并返回 null。
+function requireAuth(req, res, { admin = false } = {}) {
+  const { identity, error } = authenticate(req);
+  if (error) { sendJson(res, error.status, { error: error.code }); return null; }
+  if (admin && identity.role !== "admin") { sendJson(res, 403, { error: "admin_only" }); return null; }
+  return identity;
+}
 
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
-    if (req.method === "GET" && url.pathname === "/") {
-      res.writeHead(200, { "Content-Type":"text/html; charset=utf-8" });
-      return res.end(page);
+    const p = url.pathname;
+
+    if (req.method === "GET" && p === "/") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(PAGE);
     }
-    if (req.method === "GET" && url.pathname === "/api/pigeons") return sendJson(res, 200, db.pigeons);
-    if (req.method === "POST" && url.pathname === "/api/pigeons") {
+
+    if (req.method === "GET" && p === "/api/whoami") {
+      const { identity, error } = authenticate(req);
+      if (error) return sendJson(res, error.status, { error: error.code });
+      return sendJson(res, 200, identity);
+    }
+
+    // ---------- 鸽只档案（原有功能）----------
+    if (req.method === "GET" && p === "/api/pigeons") {
+      const state = await pigeonStore.read();
+      return sendJson(res, 200, state.pigeons);
+    }
+    if (req.method === "POST" && p === "/api/pigeons") {
+      if (!requireAuth(req, res, { admin: true })) return;
       const input = await body(req);
-      if (db.pigeons.some(item => item.ringNo === input.ringNo)) return sendJson(res, 409, { error: "ring_exists" });
-      const pigeon = { ...input, vaccines: [], transfers: [], races: [] };
-      db.pigeons.unshift(pigeon);
-      await saveDb(db);
+      const pigeon = await pigeonStore.mutate(async state => {
+        if (state.pigeons.some(item => item.ringNo === input.ringNo)) {
+          throw new DomainError("ring_exists", 409);
+        }
+        const item = {
+          ringNo: String(input.ringNo || "").trim(),
+          owner: String(input.owner || "").trim(),
+          fatherRing: input.fatherRing || "",
+          motherRing: input.motherRing || "",
+          color: String(input.color || "").trim(),
+          loft: String(input.loft || "").trim(),
+          vaccines: [], transfers: [], races: []
+        };
+        if (!item.ringNo || !item.owner || !item.color || !item.loft) throw new DomainError("missing_fields", 400);
+        state.pigeons.unshift(item);
+        return item;
+      });
       return sendJson(res, 201, pigeon);
     }
-    const relationMatch = url.pathname.match(/^\/api\/pigeons\/(.+)\/relation$/);
-    if (relationMatch && req.method === "GET") {
-      const data = relation(db, decodeURIComponent(relationMatch[1]));
-      return data ? sendJson(res, 200, data) : sendJson(res, 404, { error: "pigeon_not_found" });
-    }
-    const actionMatch = url.pathname.match(/^\/api\/pigeons\/(.+)\/(transfers|races|vaccines)$/);
-    if (actionMatch && req.method === "POST") {
-      const pigeon = db.pigeons.find(item => item.ringNo === decodeURIComponent(actionMatch[1]));
-      if (!pigeon) return sendJson(res, 404, { error: "pigeon_not_found" });
+
+    // ---------- 电子环防伪 ----------
+    if (req.method === "POST" && p === "/api/rings/devices") {
+      const identity = requireAuth(req, res, { admin: true });
+      if (!identity) return;
       const input = await body(req);
-      if (actionMatch[2] === "transfers") {
-        const transfer = { date: input.date || new Date().toISOString().slice(0, 10), from: pigeon.owner, to: input.to };
-        pigeon.owner = input.to;
-        pigeon.transfers.push(transfer);
-      }
-      if (actionMatch[2] === "races") pigeon.races.push({ date: input.date || new Date().toISOString().slice(0, 10), event: input.event, distance: Number(input.distance || 0), returnTime: input.returnTime || "", rank: Number(input.rank || 0) });
-      if (actionMatch[2] === "vaccines") pigeon.vaccines.push({ date: input.date || new Date().toISOString().slice(0, 10), name: input.name });
-      await saveDb(db);
-      return sendJson(res, 200, pigeon);
+      const result = await rings.issue({
+        ringCode: String(input.ringCode || "").trim(),
+        pigeonRingNo: String(input.pigeonRingNo || "").trim(),
+        issuedBy: "admin"
+      });
+      return sendJson(res, 201, result);
     }
-    sendJson(res, 404, { error: "not_found" });
+
+    if (req.method === "GET" && p === "/api/rings/devices") {
+      const identity = requireAuth(req, res);
+      if (!identity) return;
+      const list = await rings.listDevices({ loft: identity.loft, role: identity.role });
+      return sendJson(res, 200, list);
+    }
+
+    const oneDevice = p.match(/^\/api\/rings\/devices\/([^/]+)(\/(rotate|report|revoke))?$/);
+    if (oneDevice) {
+      const identity = requireAuth(req, res);
+      if (!identity) return;
+      const deviceId = decodeURIComponent(oneDevice[1]);
+      const action = oneDevice[3];
+
+      if (req.method === "GET" && !action) {
+        return sendJson(res, 200, await rings.getDevice(deviceId, { loft: identity.loft, role: identity.role }));
+      }
+      if (req.method === "POST" && action === "rotate") {
+        const input = await body(req);
+        const result = await rings.rotate({
+          deviceId, loft: identity.loft, keeper: identity.loft, role: identity.role,
+          expectedVersion: input.keyVersion
+        });
+        return sendJson(res, 200, result);
+      }
+      if (req.method === "POST" && action === "report") {
+        const input = await body(req);
+        const result = await rings.mark({ deviceId, reason: input.reason, loft: identity.loft, keeper: identity.loft, role: identity.role });
+        return sendJson(res, 200, result);
+      }
+      if (req.method === "POST" && action === "revoke") {
+        if (identity.role !== "admin") return sendJson(res, 403, { error: "admin_only" });
+        const result = await rings.revoke({ deviceId, by: "admin" });
+        return sendJson(res, 200, result);
+      }
+    }
+
+    if (req.method === "POST" && p === "/api/rings/activate") {
+      const identity = requireAuth(req, res);
+      if (!identity) return;
+      if (identity.role !== "keeper") return sendJson(res, 403, { error: "keeper_only" });
+      const input = await body(req);
+      // loft 强制取自令牌身份，请求体无法伪造别的棚。
+      const result = await rings.activate({
+        voucher: String(input.voucher || "").trim(),
+        loft: identity.loft,
+        keeper: identity.loft
+      });
+      return sendJson(res, 200, result);
+    }
+
+    if (req.method === "POST" && p === "/api/rings/verify") {
+      const identity = requireAuth(req, res);
+      if (!identity) return;
+      const input = await body(req);
+      // 棚管员只能校验本棚设备：loft 强制取自令牌身份，请求体无法伪造别的棚；
+      // 设备若不属于本棚，领域服务返回 cross_loft_denied 并落拒绝记录。
+      const loft = identity.role === "admin" ? String(input.loft || "") : identity.loft;
+      const result = await rings.verify({
+        deviceId: input.deviceId,
+        loft,
+        timestamp: input.timestamp,
+        nonce: input.nonce,
+        pigeonRingNo: input.pigeonRingNo,
+        signature: input.signature
+      });
+      return sendJson(res, 200, result);
+    }
+
+    if (req.method === "GET" && p === "/api/rings/verifications") {
+      const identity = requireAuth(req, res);
+      if (!identity) return;
+      const deviceId = url.searchParams.get("deviceId") || undefined;
+      const list = await rings.listVerifications({ deviceId, loft: identity.loft, role: identity.role });
+      return sendJson(res, 200, list);
+    }
+
+    return sendJson(res, 404, { error: "not_found" });
   } catch (error) {
+    if (error instanceof DomainError) return sendJson(res, error.status, { error: error.code });
     sendJson(res, 500, { error: error.message });
   }
 });
 
-server.listen(port, () => console.log(`Racing pigeon registry app listening on http://localhost:${port}`));
+if (process.env.NODE_ENV !== "test") {
+  server.listen(port, () => console.log(`Racing pigeon registry listening on http://localhost:${port}`));
+}
+
+export { server, rings, ringsStore, pigeonStore };
