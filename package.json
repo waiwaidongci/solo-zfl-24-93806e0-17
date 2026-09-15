@@ -5,6 +5,6 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/"
+    "test": "node --test test/rings.test.js test/security.test.js test/http.test.js test/legacy-upgrade.test.js"
   }
 }

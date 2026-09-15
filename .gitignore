@@ -18,3 +18,8 @@ coverage/
 .DS_Store
 .idea/
 .vscode/
+
+# 电子环主密钥与临时文件
+data/master.key
+data/*.tmp-*
+*.tmp-*

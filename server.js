@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { JsonStore } from "./lib/store.js";
 import { RingsService, initialRingsState, DomainError } from "./lib/rings.js";
+import { KeyManager } from "./lib/keystore.js";
 import { authenticate } from "./lib/auth.js";
 import { PAGE } from "./lib/page.js";
 
@@ -20,7 +21,14 @@ const seedPigeons = {
 };
 
 const pigeonStore = new JsonStore(join(dataDir, "pigeons.json"), seedPigeons);
-const ringsStore = new JsonStore(join(dataDir, "rings.json"), initialRingsState());
+await mkdir(dataDir, { recursive: true });
+// 主密钥：RING_MASTER_KEY 环境变量，或 dataDir/master.key（首启自动生成，0600）。
+const keyManager = await KeyManager.create({ dataDir });
+const ringsStore = new JsonStore(join(dataDir, "rings.json"), initialRingsState(), {
+  // 内存持明文密钥供验签；磁盘只写 AES-256-GCM 信封；旧明文数据加载即升级重写。
+  serialize: (state) => keyManager.serialize(state),
+  deserialize: (disk) => keyManager.deserialize(disk)
+});
 const rings = new RingsService(ringsStore, {
   getPigeon: (ringNo) => {
     // rings 事务期间读取鸽只档案（只读，不与 pigeonStore 事务交叉写）。
@@ -28,9 +36,9 @@ const rings = new RingsService(ringsStore, {
     return state && state.pigeons.find(p => p.ringNo === ringNo);
   }
 });
-// 服务启动时把鸽只档案载入内存，供 getPigeon 查询。
-await mkdir(dataDir, { recursive: true });
+// 服务启动时把数据载入内存（ringsStore.load 会完成旧明文数据的安全升级重写）。
 await pigeonStore.load();
+await ringsStore.load();
 
 async function body(req) {
   const chunks = [];
@@ -188,7 +196,12 @@ const server = http.createServer(async (req, res) => {
 
     return sendJson(res, 404, { error: "not_found" });
   } catch (error) {
-    if (error instanceof DomainError) return sendJson(res, error.status, { error: error.code });
+    if (error instanceof DomainError) {
+      const body = { error: error.code };
+      if (error.currentVersion !== undefined) body.currentVersion = error.currentVersion;
+      if (error.deviceLoft !== undefined) { body.deviceLoft = error.deviceLoft; body.requestLoft = error.requestLoft; }
+      return sendJson(res, error.status, body);
+    }
     sendJson(res, 500, { error: error.message });
   }
 });

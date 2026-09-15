@@ -161,6 +161,36 @@ test("HTTP 并发：同版本号轮换只有一次成功", async () => {
   assert.ok(results.filter(r => r.status !== 200).every(r => r.status === 409));
 });
 
+test("HTTP 轮换：缺 keyVersion → 400，旧版本 → 409，且无副作用", async () => {
+  // 新建鸽只 + 发环激活，拿一台 v1 设备
+  const pigeon = await api("/api/pigeons", {
+    method: "POST", headers: ADMIN,
+    body: { ringNo: "HTTP-P-X", owner: "北岸棚", color: "灰", loft: "北岸A棚" }
+  });
+  assert.equal(pigeon.status, 201);
+  const issue = await api("/api/rings/devices", {
+    method: "POST", headers: ADMIN, body: { ringCode: "HTTP-V1", pigeonRingNo: "HTTP-P-X" }
+  });
+  const act = await api("/api/rings/activate", { method: "POST", headers: BEIAN, body: { voucher: issue.data.voucher } });
+  const id = act.data.device.deviceId;
+
+  // 缺字段（空 body）
+  const noField = await api(`/api/rings/devices/${id}/rotate`, { method: "POST", headers: BEIAN, body: {} });
+  assert.equal(noField.status, 400);
+  assert.equal(noField.data.error, "missing_version");
+  // 旧版本
+  const stale = await api(`/api/rings/devices/${id}/rotate`, { method: "POST", headers: BEIAN, body: { keyVersion: 0 } });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.data.error, "version_conflict");
+  assert.equal(stale.data.currentVersion, 1);
+  // 被拒不前进：再用当前版本仍只成功一次
+  const ok = await api(`/api/rings/devices/${id}/rotate`, { method: "POST", headers: BEIAN, body: { keyVersion: 1 } });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.data.keyVersion, 2);
+  const again = await api(`/api/rings/devices/${id}/rotate`, { method: "POST", headers: BEIAN, body: { keyVersion: 1 } });
+  assert.equal(again.status, 409);
+});
+
 test("页面与静态健康检查", async () => {
   const home = await fetch(BASE + "/");
   assert.equal(home.status, 200);

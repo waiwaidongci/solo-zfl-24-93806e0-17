@@ -128,11 +128,18 @@ async function main() {
         if (d) { pigeonRingNo ||= d.pigeonRingNo; boundLoft = d.loft; }
       }
       if (!pigeonRingNo) throw new Error("无法获知 pigeonRingNo，请加 --pigeon <足环号>");
+      // 棚号 → 棚管员令牌（演示默认值；可用 KEEPER_TOKENS 覆盖，格式同服务端）。
+      const loftToken = new Map();
+      for (const pair of (process.env.KEEPER_TOKENS || "北岸A棚=keeper-beian,种鸽棚=keeper-zhong").split(",")) {
+        const i = pair.indexOf("=");
+        if (i > 0) loftToken.set(pair.slice(0, i).trim(), pair.slice(i + 1).trim());
+      }
       // --cross 用别的棚号构造并以那个棚的身份发起，用来演示跨棚拦截。
       const cross = arg(args, "cross");
-      let h;
-      if (cross) { loft = cross; h = keeper(cross === "种鸽棚" ? "keeper-zhong" : process.env.KEEPER_TOKEN || "keeper-beian"); }
-      else { h = keeper(process.env.KEEPER_TOKEN || "keeper-beian"); }
+      const explicitToken = arg(args, "keeper");
+      if (cross) loft = cross;
+      const token = explicitToken || (cross ? loftToken.get(loft) : (loftToken.get(loft) || loftToken.get(boundLoft))) || process.env.KEEPER_TOKEN || "keeper-beian";
+      const h = keeper(token);
       const fields = {
         deviceId,
         loft,
